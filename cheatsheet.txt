@@ -1,0 +1,28 @@
+Terminal1:
+~/ROS2_work/vicon_warehouse/libmotioncapture/build$ ./vicon_sender vicon 192.168.1.39
+
+Terminal2:
+~/ROS2_work/vicon_warehouse/vicon_resend_ws$ ROS_DOMAIN_ID=32 ros2 run vicon_resend vicon_resend 
+
+-------------------------------------------------------------------------------------------------------------
+
+Terminal3: (This code)
+(hj) ~/jax_work/mppi/rc_car_mppi$ python rover_jax_mppi.py
+
+Terminal 4:
+~/ROS2_work/mppi_ws$ ROS_DOMAIN_ID=32 ros2 run safe_mppi rover_race
+
+-------------------------------------------------------------------------------------------------------------
+
+Terminal 5:
+ssh jetson@jetson-desktop.local
+cd ~/sia-labrover
+./stop_modified_docker.sh (replug camera)
+./run_modified_docker.sh
+./enter_docker.sh
+ros2 run yahboomcar_bringup Ackman_driver_R2
+
+Terminal6: (stop car)
+ROS_DOMAIN_ID=32 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --once
+
+-------------------------------------------------------------------------------------------------------------
