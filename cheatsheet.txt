@@ -7,6 +7,7 @@ Terminal2:
 -------------------------------------------------------------------------------------------------------------
 
 Terminal3: (This code)
+conda activate hj
 (hj) ~/jax_work/mppi/rc_car_mppi$ python rover_jax_mppi.py
 
 Terminal 4:

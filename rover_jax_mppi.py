@@ -56,7 +56,7 @@ def get_matlab_variables(mat_file_path):
 
 #---------------------- Load MATLAB ---------------------------------------------------------
 #v3 added uopt lookup table
-matlab_var_dict= get_matlab_variables('/home/javier/jax_work/mppi/rc_car_mppi/brt_rc_wh_coarse_v3.mat')
+matlab_var_dict= get_matlab_variables('/home/javier/jax_work/mppi/rc_car_mppi/brt_rc_wh_fine_v3.mat')
 
 data = matlab_var_dict['value_func_data']
 data_lx = matlab_var_dict['lx_data']
@@ -65,6 +65,7 @@ uOpt_angle = matlab_var_dict['uOpt_angle']
 coords = [matlab_var_dict['x_coord'], matlab_var_dict['y_coord'], matlab_var_dict['th_coord']]
 
 data = jnp.array(data)
+data_lx = jnp.array(data_lx)
 uOpt_vel = jnp.array(uOpt_vel)
 uOpt_angle = jnp.array(uOpt_angle)
 coords = [jnp.array(coord) for coord in coords]
@@ -75,8 +76,8 @@ coords = [jnp.array(coord) for coord in coords]
 # Experiment Constants
 DT = 0.02
 L = 0.235
-V_MIN = 0.5
-V_MAX = 1.5
+V_MIN = 0.7
+V_MAX = 1.4
 DELTA_MIN = -0.436
 DELTA_MAX = 0.436
 
@@ -85,13 +86,38 @@ key = random.PRNGKey(0)
 
 # Simulation parameters
 HALLUCINATION_STEPS = 100
-NUM_THREADS = 500
-TEMPERATURE = 0.01
+NUM_THREADS = 1000
 
 # Safety filter parameters
 # Safety filter parameters (big negative value to disable)
 EXPERIMENT_THRESHOLD = 0.1
 HALLUCINATIONS_THRESHOLD = 0.1
+
+# MPPI cost function parameters
+W_VEL = 1.0
+W_CENTERING = 120.0
+W_COLLISION = 50.0
+W_IN_BRT = 0.0
+TEMPERATURE = 0.005
+
+# dict with all the parameters
+experiment_params = {
+    'DT': DT,
+    'L': L,
+    'V_MIN': V_MIN,
+    'V_MAX': V_MAX,
+    'DELTA_MIN': DELTA_MIN,
+    'DELTA_MAX': DELTA_MAX,
+    'HALLUCINATION_STEPS': HALLUCINATION_STEPS,
+    'NUM_THREADS': NUM_THREADS,
+    'EXPERIMENT_THRESHOLD': EXPERIMENT_THRESHOLD,
+    'HALLUCINATIONS_THRESHOLD': HALLUCINATIONS_THRESHOLD,
+    'W_VEL': W_VEL,
+    'W_CENTERING': W_CENTERING,
+    'W_COLLISION': W_COLLISION,
+    'W_IN_BRT': W_IN_BRT,
+    'TEMPERATURE': TEMPERATURE
+}
 
 # Data structures
 state_now = []
@@ -99,6 +125,8 @@ state_history = []
 control_now = (0.0, 0.0)
 control_history = []
 hallucination_history = []
+hallucination_time_history = []
+loop_time_history = []
 lr_active = []
 
 # timing structures
@@ -121,28 +149,29 @@ def ackerman_dynamics(state, control, dt=DT, L=L):
     
     new_x = x + x_dot * dt
     new_y = y + y_dot * dt
-    new_theta = theta + theta_dot * dt
-    
+    new_theta = theta + theta_dot * dt    
     # Handle the angle wrap around
     new_theta = ((new_theta + jnp.pi) % (2 * jnp.pi)) - jnp.pi
     
     return new_x, new_y, new_theta
 
 @jit
-def cost_function(states, controls, data_lx, v_target=V_MAX):
+def cost_function(states, controls, data_lx, data, v_target=V_MAX):
     x = states[0, :]
     y = states[1, :]
     th = states[2, :]
     x_idx = jnp.argmin(jnp.abs(coords[0] - x[:,jnp.newaxis]),axis=1)
     y_idx = jnp.argmin(jnp.abs(coords[1] - y[:,jnp.newaxis]),axis=1)
-    #th_idx= jnp.argmin(jnp.abs(coords[2] - th[:,jnp.newaxis]),axis=1)
+    th_idx= jnp.argmin(jnp.abs(coords[2] - th[:,jnp.newaxis]),axis=1)
     lx = data_lx[x_idx, y_idx]  # distance to nearest obstacle (max~0.45)
+    vx = data[x_idx, y_idx, th_idx]  # value function (max~1.69)
     
     v = controls[:, 0]
     #delta = controls[:, 1]
-    cost = jnp.sum((v - v_target) ** 2)  # magnitude 1.69
-    cost += jnp.sum(0.45-lx) * 5.0 # magnitude 0.45 * K
-    cost += jnp.sum(jnp.where(lx < 0, 1.0, 0.0)) * 50.0  # magnitude 1 * K
+    cost = jnp.sum((v - v_target) ** 2) * W_VEL  # magnitude 1.69
+    cost += jnp.sum(0.45-lx) * W_CENTERING # magnitude 0.45 * W
+    cost += jnp.sum(jnp.where(lx < 0.0, 1.0, 0.0)) * W_COLLISION  # magnitude 1 * W
+    cost += jnp.sum(jnp.where(vx < 0.0, 1.0, 0.0)) * W_IN_BRT  # magnitude 1 * W
     return cost 
 
 @jit
@@ -170,9 +199,9 @@ def simulate_ackerman(initial_state, disturbed_controls, data, data_lx, uOpt_vel
     updated_controls = jnp.array(updated_controls)
     
     # Compute the cost for the entire array of states and controls
-    total_cost = cost_function(states, updated_controls, data_lx)
+    total_costs = cost_function(states, updated_controls, data_lx, data)
     
-    return states, updated_controls, total_cost
+    return states, updated_controls, total_costs
 
 # Vectorize the simulation function to run multiple trajectories in parallel
 simulate_ackerman_parallel = jax.vmap(simulate_ackerman, in_axes=(None, 0, None, None, None, None, None))
@@ -214,7 +243,7 @@ try:
             state_now = (x, y, th)
             start_time_sim_step = time.time()
             # Generate random noise for multiple trajectories
-            deltas_control = random.normal(key, shape=(NUM_THREADS, HALLUCINATION_STEPS, 2)) * jnp.array([0.2, 0.1])  # Adjust the scale of noise as needed
+            deltas_control = random.normal(key, shape=(NUM_THREADS, HALLUCINATION_STEPS, 2)) * jnp.array([0.2, 0.4])  # Adjust the scale of noise as needed
 
             # Combine controls and noise before passing to the simulation function, clip to valid range
             disturbed_controls = nominal_controls + deltas_control
@@ -230,8 +259,6 @@ try:
             weights = weights[:, jnp.newaxis, jnp.newaxis]  # Adjust shape for broadcasting
             deltas_control = updated_controls - nominal_controls # Consider the updated difference to the controls
             nominal_controls = nominal_controls + jnp.sum(weights * deltas_control, axis=0) / jnp.sum(weights)
-            # Clip the controls to the valid range
-            nominal_controls = jnp.clip(nominal_controls, jnp.array([V_MIN, DELTA_MIN]), jnp.array([V_MAX, DELTA_MAX]))
             
             # Check value function and apply LR filter
             #find index in coords closest to state to get value and optimal control       
@@ -242,44 +269,50 @@ try:
             uOpt_vel_now = uOpt_vel[x_idx, y_idx, th_idx]
             uOpt_angle_now = uOpt_angle[x_idx, y_idx, th_idx]
             
+            # BASIC LR TEST
             # control_now = np.array([1.0, 0.0])
             # control_now = np.array([uOpt_vel_now, uOpt_angle_now]) * (value_now < EXPERIMENT_THRESHOLD) + control_now * (value_now >= EXPERIMENT_THRESHOLD)
             
             if value_now < EXPERIMENT_THRESHOLD:
               control_now = jnp.array([uOpt_vel_now,uOpt_angle_now])
             else:
-              control_now = nominal_controls[0]  
-        
-            print(f"Value at this point: {value_now}")
-            print(f"control: {control_now}")
-                        
-            # Store the state, control, and hallucinations for visualization
-            state_history.append(state_now)
-            control_history.append(control_now)
-            hallucination_history.append(states_parallel)
-            lr_active.append(value_now < EXPERIMENT_THRESHOLD)
-            
+              control_now = nominal_controls[0]                
+
             # Move the control sequence one step forward and maintain the last control
             nominal_controls = jnp.roll(nominal_controls, -1, axis=0)
             nominal_controls = nominal_controls.at[-1].set(nominal_controls[-2])
 
             end_time_sim_step = time.time()
-            # Print and save the elapsed times
-            print(f"Elapsed time for rollouts {(end_time_rollouts - start_time_rollouts)*1000:.1f} ms")
-            print(f"Elapsed time for sim step {(end_time_sim_step - start_time_sim_step)*1000:.1f} ms")
+            # Print relevant information
+            print(f"Value at this point: {value_now}")
+            print(f"control: {control_now}")
+            hallucination_time = (end_time_rollouts - start_time_rollouts)*1000
+            loop_time = (end_time_sim_step - start_time_sim_step)*1000  
+            print(f"Elapsed time for rollouts {hallucination_time :.1f} ms")
+            print(f"Elapsed time for loop {loop_time :.1f} ms")
+            
+            # Store the state, control, and hallucinations for visualization
+            state_history.append(state_now)
+            control_history.append(control_now)
+            hallucination_history.append(states_parallel)
+            hallucination_time_history.append(hallucination_time)
+            loop_time_history.append(loop_time)
+            lr_active.append(value_now < EXPERIMENT_THRESHOLD)
                     
             #send value to client
             connection.sendall(str(control_now).encode())
                         
-        else:
-            print("No message received")
-            break
+        # else:
+        #     print("No message received")
+        #     break
           
 except KeyboardInterrupt:
     print("Stopping the UDP listener")    
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     filename = f'mppi_data_{timestamp}.npz'
-    np.savez(filename, state_history=state_history, control_history=control_history, hallucination_history=hallucination_history, lr_active=lr_active)
+    np.savez(filename, state_history=state_history, control_history=control_history, hallucination_history=hallucination_history,
+             hallucination_time_history=hallucination_time_history, loop_time_history=loop_time_history , lr_active=lr_active,
+             experiment_params=experiment_params)
     print(f"Data saved to {filename}")         
 finally:
     # Clean up the connection
